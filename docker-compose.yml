@@ -1,0 +1,82 @@
+# Full stack: API, outbox relay, delivery workers, scheduler, Postgres, Redis
+# and a flaky receiver to watch retries happen.
+#
+#   docker compose up --build
+#   docker compose up --build --scale worker=4   # scale delivery workers out
+
+x-app: &app
+  build: .
+  image: hookrelay:local
+  env_file: .env.example
+  environment:
+    POSTGRES_HOST: db
+    CELERY_BROKER_URL: redis://redis:6379/0
+    REDIS_URL: redis://redis:6379/1
+  restart: unless-stopped
+
+x-depends: &depends
+  db:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  migrate:
+    condition: service_completed_successfully
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: hookrelay
+      POSTGRES_USER: hookrelay
+      POSTGRES_PASSWORD: hookrelay
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hookrelay"]
+      interval: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+
+  migrate:
+    <<: *app
+    command: python manage.py migrate --noinput
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports:
+      - "8000:8000"
+    depends_on: *depends
+
+  relay:
+    <<: *app
+    command: celery -A config worker -Q outbox -c 2 -n relay@%h --loglevel=INFO
+    depends_on: *depends
+
+  worker:
+    <<: *app
+    command: celery -A config worker -Q deliveries -c 16 -n worker@%h --loglevel=INFO
+    depends_on: *depends
+
+  beat:
+    <<: *app
+    command: celery -A config beat --loglevel=INFO -s /tmp/celerybeat-schedule
+    depends_on: *depends
+
+  receiver:
+    <<: *app
+    command: python scripts/flaky_receiver.py --port 9000 --failure-rate 0.3
+    ports:
+      - "9000:9000"
+
+volumes:
+  pgdata:
